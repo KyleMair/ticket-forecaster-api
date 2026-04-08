@@ -53,6 +53,7 @@ class EventItem(BaseModel):
     start_date: str
     end_date: str
     spike_pct: float
+    event_type: str = 'custom'  # product | sale | holiday | custom
 
 
 class ForecastRequest(BaseModel):
@@ -124,23 +125,26 @@ def run_model(df: pd.DataFrame, req: ForecastRequest):
             result.at[idx, 'forecast'] = round(row['forecast'] * mult)
             result.at[idx, 'lower']    = round(row['lower'] * mult)
             result.at[idx, 'upper']    = round(row['upper'] * mult)
-            event_names[idx] = label
+            event_names[idx] = (label, 'bfcm')
         for ev in req.events:
             if pd.Timestamp(ev.start_date) <= pd.Timestamp(row['ds']) <= pd.Timestamp(ev.end_date):
                 mult = 1 + ev.spike_pct / 100.0
                 result.at[idx, 'forecast'] = round(result.at[idx, 'forecast'] * mult)
                 result.at[idx, 'lower']    = round(result.at[idx, 'lower'] * mult)
                 result.at[idx, 'upper']    = round(result.at[idx, 'upper'] * mult)
-                event_names[idx] = ev.name
+                event_names[idx] = (ev.name, ev.event_type)
 
-    points = [
-        {'date': pd.Timestamp(r['ds']).strftime('%Y-%m-%d'),
-         'forecast': int(r['forecast']),
-         'lower':    int(r['lower']),
-         'upper':    int(r['upper']),
-         'event':    event_names.get(i)}
-        for i, r in result.iterrows()
-    ]
+    points = []
+    for i, r in result.iterrows():
+        ev = event_names.get(i)
+        points.append({
+            'date':       pd.Timestamp(r['ds']).strftime('%Y-%m-%d'),
+            'forecast':   int(r['forecast']),
+            'lower':      int(r['lower']),
+            'upper':      int(r['upper']),
+            'event':      ev[0] if ev else None,
+            'event_type': ev[1] if ev else None,
+        })
 
     model_info = {
         'training_rows': len(train),
