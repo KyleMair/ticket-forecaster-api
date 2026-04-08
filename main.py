@@ -1,5 +1,4 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import pandas as pd
@@ -12,17 +11,20 @@ from datetime import date, timedelta, datetime
 
 app = FastAPI(title="Ticket Forecaster API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://www.kylemair.com",
-        "https://kylemair.com",
-        "http://localhost",
-        "http://127.0.0.1",
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    if request.method == "OPTIONS":
+        from starlette.responses import Response
+        response = Response()
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 
 # ---------------------------------------------------------------------------
