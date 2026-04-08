@@ -127,12 +127,16 @@ def run_model(df: pd.DataFrame, req: ForecastRequest):
             result.at[idx, 'upper']    = round(row['upper'] * mult)
             event_names[idx] = (label, 'bfcm')
         for ev in req.events:
-            if pd.Timestamp(ev.start_date) <= pd.Timestamp(row['ds']) <= pd.Timestamp(ev.end_date):
-                mult = 1 + ev.spike_pct / 100.0
-                result.at[idx, 'forecast'] = round(result.at[idx, 'forecast'] * mult)
-                result.at[idx, 'lower']    = round(result.at[idx, 'lower'] * mult)
-                result.at[idx, 'upper']    = round(result.at[idx, 'upper'] * mult)
-                event_names[idx] = (ev.name, ev.event_type)
+            ev_start = pd.Timestamp(ev.start_date)
+            ev_end   = pd.Timestamp(ev.end_date)
+            row_ds   = pd.Timestamp(row['ds'])
+            if ev_start <= row_ds <= ev_end:
+                mult = 1 + float(ev.spike_pct) / 100.0
+                result.at[idx, 'forecast'] = round(float(result.at[idx, 'forecast']) * mult)
+                result.at[idx, 'lower']    = round(float(result.at[idx, 'lower']) * mult)
+                result.at[idx, 'upper']    = round(float(result.at[idx, 'upper']) * mult)
+                etype = getattr(ev, 'event_type', 'custom')
+                event_names[idx] = (ev.name, etype)
 
     points = []
     for i, r in result.iterrows():
