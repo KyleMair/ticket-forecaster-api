@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import pandas as pd
 import numpy as np
 from statsforecast import StatsForecast
@@ -44,21 +44,17 @@ async def add_cors_headers(request, call_next):
     return response
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
 class EventItem(BaseModel):
     name: str
     start_date: str
     end_date: str
     spike_pct: float
-    event_type: str = 'custom'  # product | sale | holiday | custom
+    event_type: str = 'custom'
 
 
 class ForecastRequest(BaseModel):
     horizon_days: int = 90
-    events: Optional[list[EventItem]] = []
+    events: List[EventItem] = []
 
 
 BFCM_DATES = {
@@ -68,10 +64,6 @@ BFCM_DATES = {
     '12-01': ('Cyber Monday', 1.15),
 }
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def parse_csv(contents: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(contents))
@@ -87,21 +79,53 @@ def parse_csv(contents: bytes) -> pd.DataFrame:
     return df.dropna(subset=['date', 'tickets'])
 
 
+def apply_events(result: pd.DataFrame, events: List[EventItem], bfcm: dict):
+    event_names = {}
+    for idx in range(len(result)):
+        ds = pd.Timestamp(result.loc[idx, 'ds'])
+        mmdd = ds.strftime('%m-%d')
+
+        # BFCM
+        if mmdd in bfcm:
+            label, mult = bfcm[mmdd]
+            result.loc[idx, 'forecast'] = round(float(result.loc[idx, 'forecast']) * mult)
+            result.loc[idx, 'lower']    = round(float(result.loc[idx, 'lower']) * mult)
+            result.loc[idx, 'upper']    = round(float(result.loc[idx, 'upper']) * mult)
+            event_names[idx] = (label, 'bfcm')
+
+        # Custom events
+        for ev in events:
+            ev_start = pd.Timestamp(ev.start_date)
+            ev_end   = pd.Timestamp(ev.end_date)
+            if ev_start <= ds <= ev_end:
+                mult = 1.0 + float(ev.spike_pct) / 100.0
+                result.loc[idx, 'forecast'] = round(float(result.loc[idx, 'forecast']) * mult)
+                result.loc[idx, 'lower']    = round(float(result.loc[idx, 'lower']) * mult)
+                result.loc[idx, 'upper']    = round(float(result.loc[idx, 'upper']) * mult)
+                event_names[idx] = (ev.name, ev.event_type)
+
+    return result, event_names
+
+
 def run_model(df: pd.DataFrame, req: ForecastRequest):
-    has_orders = 'orders' in df.columns and df['orders'].notna().sum() > 10
+    has_orders  = 'orders'  in df.columns and df['orders'].notna().sum() > 10
     has_revenue = 'revenue' in df.columns and df['revenue'].notna().sum() > 10
 
     if has_orders and has_revenue:
-        y = (df['tickets']/df['tickets'].mean()*0.60
-           + df['orders']/df['orders'].mean()*0.25
-           + df['revenue']/df['revenue'].mean()*0.15) * df['tickets'].mean()
+        y = (df['tickets']  / df['tickets'].mean()  * 0.60
+           + df['orders']   / df['orders'].mean()   * 0.25
+           + df['revenue']  / df['revenue'].mean()  * 0.15) * df['tickets'].mean()
     elif has_orders:
-        y = (df['tickets']/df['tickets'].mean()*0.70
-           + df['orders']/df['orders'].mean()*0.30) * df['tickets'].mean()
+        y = (df['tickets'] / df['tickets'].mean() * 0.70
+           + df['orders']  / df['orders'].mean()  * 0.30) * df['tickets'].mean()
     else:
         y = df['tickets'].astype(float)
 
-    train = pd.DataFrame({'unique_id': 'tickets', 'ds': df['date'], 'y': y.values})
+    train = pd.DataFrame({
+        'unique_id': 'tickets',
+        'ds': df['date'],
+        'y': y.values.astype(float)
+    })
 
     sf = StatsForecast(
         models=[AutoARIMA(season_length=7), AutoETS(season_length=7)],
@@ -115,37 +139,18 @@ def run_model(df: pd.DataFrame, req: ForecastRequest):
         'forecast': ((raw['AutoARIMA'] + raw['AutoETS']) / 2).clip(lower=0).round(0),
         'lower':    ((raw['AutoARIMA-lo-80'] + raw['AutoETS-lo-80']) / 2).clip(lower=0).round(0),
         'upper':    ((raw['AutoARIMA-hi-80'] + raw['AutoETS-hi-80']) / 2).clip(lower=0).round(0),
-    })
+    }).reset_index(drop=True)
 
-    event_names = {}
-    for idx, row in result.iterrows():
-        mmdd = pd.Timestamp(row['ds']).strftime('%m-%d')
-        if mmdd in BFCM_DATES:
-            label, mult = BFCM_DATES[mmdd]
-            result.at[idx, 'forecast'] = round(row['forecast'] * mult)
-            result.at[idx, 'lower']    = round(row['lower'] * mult)
-            result.at[idx, 'upper']    = round(row['upper'] * mult)
-            event_names[idx] = (label, 'bfcm')
-        for ev in req.events:
-            ev_start = pd.Timestamp(ev.start_date)
-            ev_end   = pd.Timestamp(ev.end_date)
-            row_ds   = pd.Timestamp(row['ds'])
-            if ev_start <= row_ds <= ev_end:
-                mult = 1 + float(ev.spike_pct) / 100.0
-                result.at[idx, 'forecast'] = round(float(result.at[idx, 'forecast']) * mult)
-                result.at[idx, 'lower']    = round(float(result.at[idx, 'lower']) * mult)
-                result.at[idx, 'upper']    = round(float(result.at[idx, 'upper']) * mult)
-                etype = getattr(ev, 'event_type', 'custom')
-                event_names[idx] = (ev.name, etype)
+    result, event_names = apply_events(result, req.events, BFCM_DATES)
 
     points = []
-    for i, r in result.iterrows():
-        ev = event_names.get(i)
+    for idx in range(len(result)):
+        ev = event_names.get(idx)
         points.append({
-            'date':       pd.Timestamp(r['ds']).strftime('%Y-%m-%d'),
-            'forecast':   int(r['forecast']),
-            'lower':      int(r['lower']),
-            'upper':      int(r['upper']),
+            'date':       pd.Timestamp(result.loc[idx, 'ds']).strftime('%Y-%m-%d'),
+            'forecast':   int(result.loc[idx, 'forecast']),
+            'lower':      int(result.loc[idx, 'lower']),
+            'upper':      int(result.loc[idx, 'upper']),
             'event':      ev[0] if ev else None,
             'event_type': ev[1] if ev else None,
         })
@@ -162,20 +167,14 @@ def run_model(df: pd.DataFrame, req: ForecastRequest):
     return points, model_info
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
 @app.post("/forecast")
 async def forecast(file: UploadFile = File(...), params: str = "{}"):
     try:
         req = ForecastRequest(**json.loads(params))
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Invalid params: {e}")
-
     df = parse_csv(await file.read())
     points, model_info = run_model(df, req)
-
     return JSONResponse(content={'forecast': points, 'model_info': model_info})
 
 
@@ -185,10 +184,8 @@ async def save_forecast(file: UploadFile = File(...), params: str = "{}"):
         req = ForecastRequest(**json.loads(params))
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Invalid params: {e}")
-
     df = parse_csv(await file.read())
     points, model_info = run_model(df, req)
-
     forecast_id = uuid.uuid4().hex[:8]
     conn = get_db()
     conn.execute(
@@ -197,12 +194,7 @@ async def save_forecast(file: UploadFile = File(...), params: str = "{}"):
     )
     conn.commit()
     conn.close()
-
-    return JSONResponse(content={
-        'id': forecast_id,
-        'forecast': points,
-        'model_info': model_info
-    })
+    return JSONResponse(content={'id': forecast_id, 'forecast': points, 'model_info': model_info})
 
 
 @app.get("/forecast/{forecast_id}")
@@ -213,10 +205,8 @@ async def get_forecast(forecast_id: str):
         (forecast_id,)
     ).fetchone()
     conn.close()
-
     if not row:
         raise HTTPException(status_code=404, detail=f"Forecast '{forecast_id}' not found.")
-
     return JSONResponse(content={
         'id':         row[0],
         'created_at': row[1],
