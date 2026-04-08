@@ -14,7 +14,12 @@ app = FastAPI(title="Ticket Forecaster API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://www.kylemair.com",
+        "https://kylemair.com",
+        "http://localhost",
+        "http://127.0.0.1",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
