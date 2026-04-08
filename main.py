@@ -234,14 +234,31 @@ def run_model(
     # in the ensemble (but we still need AutoARIMA for exogenous support).
     # Strategy: fit MSTL + AutoCES + AutoTheta for the univariate ensemble,
     # and AutoARIMA(X_df) as a fourth member when exogenous data exists.
+    #
+    # IMPORTANT: statsforecast uses each model's internal alias as the column
+    # name in predict/CV output, NOT the Python class name. We derive the real
+    # column names by doing a quick dummy fit so nothing is hardcoded.
     if use_annual:
         univariate_models = [mstl, ces, theta]
-        model_names_uni = ["MSTL", "AutoCES", "AutoTheta"]
         exog_model_name = "AutoARIMA" if build_x else None
     else:
         univariate_models = [arimax, ces, theta]
-        model_names_uni = ["AutoARIMA", "AutoCES", "AutoTheta"]
         exog_model_name = None  # AutoARIMA IS the exog model
+
+    def _get_model_col_names(models):
+        """Fit on a tiny dummy series to discover the real statsforecast column aliases."""
+        rng = np.random.default_rng(42)
+        dummy = pd.DataFrame({
+            "unique_id": "x",
+            "ds": pd.date_range("2020-01-01", periods=30, freq="D"),
+            "y": rng.integers(50, 150, 30).astype(float),
+        })
+        sf_tmp = StatsForecast(models=models, freq="D", n_jobs=1)
+        sf_tmp.fit(dummy)
+        out = sf_tmp.predict(h=1)
+        return [c for c in out.columns if c not in ("unique_id", "ds")]
+
+    model_names_uni = _get_model_col_names(univariate_models)
 
     # For the exogenous-only AutoARIMA when MSTL is active:
     exog_arimax = None
@@ -278,8 +295,11 @@ def run_model(
                     step_size=horizon_days,
                     X_df=x_train,
                 )
-                errors["AutoARIMA"] = float(
-                    np.mean(np.abs(cv_exog["AutoARIMA"].values - cv_exog["y"].values))
+                # Discover the real ARIMA alias from the CV output columns
+                exog_arima_col = [c for c in cv_exog.columns
+                                  if c not in ("unique_id", "ds", "y", "cutoff")][0]
+                errors[exog_arima_col] = float(
+                    np.mean(np.abs(cv_exog[exog_arima_col].values - cv_exog["y"].values))
                 )
 
             # Inverse-error weighting (softmax-stable)
@@ -322,20 +342,23 @@ def run_model(
             lo += w * (raw_uni[m].values * 0.80)
             hi += w * (raw_uni[m].values * 1.20)
 
+    # Discover the real column alias for a standalone AutoARIMA model
+    arima_col = _get_model_col_names([AutoARIMA(season_length=7)])[0]
+
     # Blend in exogenous AutoARIMA if active
     if build_x and use_annual and exog_arimax:
         sf_exog = StatsForecast(models=[exog_arimax], freq="D", n_jobs=1)
         sf_exog.fit(train[["unique_id", "ds", "y"]], X_df=x_train)
         raw_exog = sf_exog.predict(h=horizon_days, X_df=x_future, level=[80])
-        w_exog = weights.get("AutoARIMA", 0.0)
-        forecast += w_exog * raw_exog["AutoARIMA"].values
-        lo += w_exog * raw_exog["AutoARIMA-lo-80"].values
-        hi += w_exog * raw_exog["AutoARIMA-hi-80"].values
+        w_exog = weights.get(arima_col, 0.0)
+        forecast += w_exog * raw_exog[arima_col].values
+        lo += w_exog * raw_exog.get(f"{arima_col}-lo-80", raw_exog[arima_col]).values
+        hi += w_exog * raw_exog.get(f"{arima_col}-hi-80", raw_exog[arima_col]).values
 
     elif build_x and not use_annual:
         # AutoARIMA is in univariate_models but was fit without X_df.
         # Re-fit it with X_df and replace its contribution.
-        w_arima = weights.get("AutoARIMA", 0.0)
+        w_arima = weights.get(arima_col, 0.0)
         if w_arima > 0:
             sf_exog = StatsForecast(
                 models=[AutoARIMA(season_length=7, prediction_intervals=ci)],
@@ -345,12 +368,12 @@ def run_model(
             raw_exog = sf_exog.predict(h=horizon_days, X_df=x_future, level=[80])
 
             # Subtract the univariate ARIMA contribution and add exog version
-            forecast -= w_arima * raw_uni["AutoARIMA"].values
-            lo       -= w_arima * raw_uni.get("AutoARIMA-lo-80", raw_uni["AutoARIMA"]).values
-            hi       -= w_arima * raw_uni.get("AutoARIMA-hi-80", raw_uni["AutoARIMA"]).values
-            forecast += w_arima * raw_exog["AutoARIMA"].values
-            lo       += w_arima * raw_exog["AutoARIMA-lo-80"].values
-            hi       += w_arima * raw_exog["AutoARIMA-hi-80"].values
+            forecast -= w_arima * raw_uni[arima_col].values
+            lo       -= w_arima * raw_uni.get(f"{arima_col}-lo-80", raw_uni[arima_col]).values
+            hi       -= w_arima * raw_uni.get(f"{arima_col}-hi-80", raw_uni[arima_col]).values
+            forecast += w_arima * raw_exog[arima_col].values
+            lo       += w_arima * raw_exog.get(f"{arima_col}-lo-80", raw_exog[arima_col]).values
+            hi       += w_arima * raw_exog.get(f"{arima_col}-hi-80", raw_exog[arima_col]).values
 
     # Clamp to non-negative (count data)
     forecast = np.maximum(forecast, 0)
