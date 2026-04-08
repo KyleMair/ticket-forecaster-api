@@ -1,7 +1,6 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-prophet==1.1.6
-pystan==3.9.1
+statsforecast==1.7.5
 pandas==2.2.2
 numpy==1.26.4
 python-multipart==0.0.9
