@@ -413,7 +413,7 @@ def parse_csv(content: bytes) -> pd.DataFrame:
       revenue/sales  →  revenue
     """
     from io import StringIO
-    text = content.decode("utf-8", errors="replace")
+    text = content.decode("utf-8-sig", errors="replace")  # utf-8-sig strips BOM if present
     # Auto-detect delimiter: use tab if present in the first line, else comma
     first_line = text.split("\n")[0]
     sep = "\t" if "\t" in first_line else ","
