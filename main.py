@@ -202,8 +202,7 @@ def run_model(
         x_future = future_x
 
     # -----------------------------------------------------------------------
-    # Conformal intervals — use cross-validation on residuals
-    # guarantees empirical coverage at the requested level
+    # Conformal prediction intervals — guaranteed empirical coverage
     # -----------------------------------------------------------------------
     ci = ConformalIntervals(h=horizon_days, n_windows=N_CV_WINDOWS)
     interval_type = "conformal"
@@ -225,7 +224,6 @@ def run_model(
         )
 
     # AutoARIMA is the exogenous-capable anchor model.
-    # We run it both with and without MSTL depending on history length.
     arimax = AutoARIMA(season_length=7, prediction_intervals=ci)
     ces   = AutoCES(season_length=7, prediction_intervals=ci)
     theta = AutoTheta(season_length=7, prediction_intervals=ci)
@@ -309,12 +307,12 @@ def run_model(
 
         except Exception:
             # Fall back to equal weights if CV fails (e.g., too little data)
-            all_models = model_names_uni + (["AutoARIMA"] if build_x and exog_arimax else [])
+            all_models = model_names_uni + ([arima_col] if build_x and exog_arimax else [])
             weights = {m: 1.0 / len(all_models) for m in all_models}
             errors  = {m: float("nan") for m in all_models}
     else:
-        # Insufficient history — equal weights
-        all_models = model_names_uni + (["AutoARIMA"] if build_x and exog_arimax else [])
+        # Insufficient history for CV — equal weights
+        all_models = model_names_uni + ([arima_col] if build_x and exog_arimax else [])
         weights = {m: 1.0 / len(all_models) for m in all_models}
         errors  = {m: float("nan") for m in all_models}
 
@@ -416,7 +414,10 @@ def parse_csv(content: bytes) -> pd.DataFrame:
     """
     from io import StringIO
     text = content.decode("utf-8", errors="replace")
-    df = pd.read_csv(StringIO(text))
+    # Auto-detect delimiter: use tab if present in the first line, else comma
+    first_line = text.split("\n")[0]
+    sep = "\t" if "\t" in first_line else ","
+    df = pd.read_csv(StringIO(text), sep=sep)
     df.columns = [c.strip().lower() for c in df.columns]
 
     # Map date column
@@ -428,7 +429,7 @@ def parse_csv(content: bytes) -> pd.DataFrame:
     df["ds"] = pd.to_datetime(df["ds"])
 
     # Map target column
-    y_candidates = ["tickets", "y", "volume", "count", "ticket_count"]
+    y_candidates = ["tickets", "y", "volume", "count", "ticket_count", "ticket_volume", "support_tickets", "num_tickets", "total_tickets"]
     y_col = next((c for c in y_candidates if c in df.columns), None)
     if y_col is None:
         raise ValueError("No ticket column found. Expected: tickets, y, volume, or count.")
