@@ -132,297 +132,248 @@ def run_model(
     progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
-    Fit an ensemble of statistical models and return a forecast with
-    conformal prediction intervals and CV-derived ensemble weights.
-
-    Args:
-        train:           DataFrame with columns [unique_id, ds, y]
-                         and optionally [orders, revenue].
-        horizon_days:    Number of days to forecast.
-        events:          List of event dicts with start_date/end_date/window_days.
-        has_regressors:  Whether orders/revenue columns are present.
-        progress:        Optional callback(message: str) called at key steps.
-
-    Returns:
-        dict with keys: dates, forecast, lower, upper, weights, errors,
-                        seasonality_mode, interval_type
+    Fit a CV-weighted ensemble and return a forecast with conformal intervals.
+    Optimised for Render free tier: CV uses bare models (no ConformalIntervals),
+    column aliases are discovered once and cached, MSTL only activates with 2yr data.
     """
+    import copy
+
     def _p(msg: str):
         if progress:
             progress(msg)
+
     n = len(train)
     uid = train["unique_id"].iloc[0]
 
     # -----------------------------------------------------------------------
-    # Decide seasonality mode
+    # Column alias discovery — run once with bare models, no ConformalIntervals
+    # -----------------------------------------------------------------------
+    KNOWN_ALIASES = {
+        "AutoARIMA": "AutoARIMA",
+        "AutoCES":   "CES",
+        "AutoTheta": "Theta",
+        "MSTL":      "MSTL",
+    }
+
+    def _bare(m):
+        """Return a copy of a model with prediction_intervals stripped."""
+        m2 = copy.copy(m)
+        if hasattr(m2, "prediction_intervals"):
+            m2.prediction_intervals = None
+        return m2
+
+    def _col_names(models):
+        """Resolve column aliases using the known map; fall back to dummy fit only
+        for any model not in the map."""
+        names = []
+        unknown = []
+        for m in models:
+            cls = type(m).__name__
+            if cls in KNOWN_ALIASES:
+                names.append(KNOWN_ALIASES[cls])
+            else:
+                unknown.append((len(names), m))
+                names.append(None)  # placeholder
+
+        if unknown:
+            rng = np.random.default_rng(42)
+            dummy = pd.DataFrame({
+                "unique_id": "x",
+                "ds": pd.date_range("2020-01-01", periods=30, freq="D"),
+                "y": rng.integers(50, 150, 30).astype(float),
+            })
+            sf_tmp = StatsForecast(models=[_bare(m) for _, m in unknown], freq="D", n_jobs=1)
+            sf_tmp.fit(dummy)
+            out = sf_tmp.predict(h=1)
+            discovered = [c for c in out.columns if c not in ("unique_id", "ds")]
+            for (idx, _), col in zip(unknown, discovered):
+                names[idx] = col
+
+        return names
+
+    # -----------------------------------------------------------------------
+    # Seasonality / data flags
     # -----------------------------------------------------------------------
     _p(f"Loaded {n} days of training data")
     use_annual = n >= MIN_ROWS_FOR_ANNUAL
     seasonality_mode = "weekly+annual (MSTL)" if use_annual else "weekly"
-    _p(f"Seasonality mode: {seasonality_mode}")
+    _p(f"Seasonality: {seasonality_mode}")
+
+    has_events  = bool(events)
+    has_orders  = "orders" in train.columns and train["orders"].notna().any()
+    has_revenue = "revenue" in train.columns and train["revenue"].notna().any()
+    build_x     = has_events or (has_regressors and (has_orders or has_revenue))
+
+    future_dates = pd.date_range(
+        start=train["ds"].max() + timedelta(days=1),
+        periods=horizon_days, freq="D",
+    )
 
     # -----------------------------------------------------------------------
-    # Build exogenous feature DataFrames
+    # Exogenous features
     # -----------------------------------------------------------------------
     x_train: Optional[pd.DataFrame] = None
     x_future: Optional[pd.DataFrame] = None
 
-    future_dates = pd.date_range(
-        start=train["ds"].max() + timedelta(days=1),
-        periods=horizon_days,
-        freq="D",
-    )
-
-    has_events = bool(events)
-    has_orders = "orders" in train.columns and train["orders"].notna().any()
-    has_revenue = "revenue" in train.columns and train["revenue"].notna().any()
-
-    # We can only pass X_df to AutoARIMA (not MSTL's internal trend forecaster,
-    # not AutoETS/AutoCES/AutoTheta). So if we have any exogenous data, we
-    # build a unified X_df for AutoARIMA and run the others without it.
-    build_x = has_events or (has_regressors and (has_orders or has_revenue))
     if build_x:
-        _p("Building exogenous feature columns (orders, revenue, event flags)")
-
-    if build_x:
+        _p("Building exogenous feature columns")
         train_x = train[["unique_id", "ds"]].copy()
         if has_orders:
             train_x["orders"] = train["orders"].fillna(train["orders"].median())
         if has_revenue:
             train_x["revenue"] = train["revenue"].fillna(train["revenue"].median())
-
         if has_events:
-            train_with_events = train[["unique_id", "ds"]].copy()
-            train_with_events = add_event_features(train_with_events, events)
+            tmp = add_event_features(train[["unique_id", "ds"]].copy(), events)
             for col in ["is_event", "event_lead", "event_lag"]:
-                train_x[col] = train_with_events[col].values
-
+                train_x[col] = tmp[col].values
         x_train = train_x
 
-        # Future X: carry forward recent regressor mean; events from calendar
         future_x = pd.DataFrame({"unique_id": uid, "ds": future_dates})
         if has_orders:
             future_x["orders"] = train["orders"].iloc[-14:].mean()
         if has_revenue:
             future_x["revenue"] = train["revenue"].iloc[-14:].mean()
         if has_events:
-            future_with_events = add_event_features(future_x, events)
+            tmp2 = add_event_features(future_x.copy(), events)
             for col in ["is_event", "event_lead", "event_lag"]:
-                future_x[col] = future_with_events[col].values
-
+                future_x[col] = tmp2[col].values
         x_future = future_x
 
     # -----------------------------------------------------------------------
-    # Conformal prediction intervals — guaranteed empirical coverage
-    # -----------------------------------------------------------------------
-    _p("Configuring conformal prediction intervals")
-    ci = ConformalIntervals(h=horizon_days, n_windows=N_CV_WINDOWS)
-    interval_type = "conformal"
-
-    # -----------------------------------------------------------------------
     # Model pool
-    # MSTL handles multi-seasonality; the others provide ensemble diversity.
-    # AutoARIMA receives exogenous data; the others are univariate.
+    # CV uses bare models (no ConformalIntervals) — much faster.
+    # Final fit uses conformal models for calibrated intervals.
     # -----------------------------------------------------------------------
+    _p("Preparing model pool")
+
+    mstl_bare  = MSTL(season_length=[7, 365] if use_annual else [7],
+                      trend_forecaster=AutoARIMA())
+    arima_bare = AutoARIMA(season_length=7)
+    ces_bare   = AutoCES(season_length=7)
+    theta_bare = AutoTheta(season_length=7)
+
+    ci = ConformalIntervals(h=horizon_days, n_windows=N_CV_WINDOWS)
+
+    mstl_ci  = MSTL(season_length=[7, 365] if use_annual else [7],
+                    trend_forecaster=AutoARIMA())
+    arima_ci = AutoARIMA(season_length=7, prediction_intervals=ci)
+    ces_ci   = AutoCES(season_length=7,   prediction_intervals=ci)
+    theta_ci = AutoTheta(season_length=7, prediction_intervals=ci)
+
     if use_annual:
-        mstl = MSTL(
-            season_length=[7, 365],
-            trend_forecaster=AutoARIMA(),
-        )
+        cv_models    = [mstl_bare,  ces_bare,  theta_bare]
+        final_models = [mstl_ci,    ces_ci,    theta_ci]
     else:
-        mstl = MSTL(
-            season_length=[7],
-            trend_forecaster=AutoARIMA(),
-        )
+        cv_models    = [arima_bare, ces_bare,  theta_bare]
+        final_models = [arima_ci,   ces_ci,    theta_ci]
 
-    # AutoARIMA is the exogenous-capable anchor model.
-    arimax = AutoARIMA(season_length=7, prediction_intervals=ci)
-    ces   = AutoCES(season_length=7, prediction_intervals=ci)
-    theta = AutoTheta(season_length=7, prediction_intervals=ci)
-
-    # When annual seasonality is available, MSTL replaces standalone AutoARIMA
-    # in the ensemble (but we still need AutoARIMA for exogenous support).
-    # Strategy: fit MSTL + AutoCES + AutoTheta for the univariate ensemble,
-    # and AutoARIMA(X_df) as a fourth member when exogenous data exists.
-    #
-    # IMPORTANT: statsforecast uses each model's internal alias as the column
-    # name in predict/CV output, NOT the Python class name. We derive the real
-    # column names by doing a quick dummy fit so nothing is hardcoded.
-    if use_annual:
-        univariate_models = [mstl, ces, theta]
-        exog_model_name = "AutoARIMA" if build_x else None
-    else:
-        univariate_models = [arimax, ces, theta]
-        exog_model_name = None  # AutoARIMA IS the exog model
-
-    def _get_model_col_names(models):
-        """
-        Fit on a tiny dummy series to discover the real statsforecast column aliases.
-        We strip prediction_intervals off each model before the dummy fit — ConformalIntervals
-        requires hundreds of rows and would crash on the 30-row dummy series.
-        Column aliases are determined by model type, not by the intervals setting.
-        """
-        import copy
-        bare_models = []
-        for m in models:
-            m2 = copy.copy(m)
-            if hasattr(m2, "prediction_intervals"):
-                m2.prediction_intervals = None
-            bare_models.append(m2)
-
-        rng = np.random.default_rng(42)
-        dummy = pd.DataFrame({
-            "unique_id": "x",
-            "ds": pd.date_range("2020-01-01", periods=30, freq="D"),
-            "y": rng.integers(50, 150, 30).astype(float),
-        })
-        sf_tmp = StatsForecast(models=bare_models, freq="D", n_jobs=1)
-        sf_tmp.fit(dummy)
-        out = sf_tmp.predict(h=1)
-        return [c for c in out.columns if c not in ("unique_id", "ds")]
-
-    model_names_uni = _get_model_col_names(univariate_models)
-
-    # For the exogenous-only AutoARIMA when MSTL is active:
-    exog_arimax = None
-    if use_annual and build_x:
-        exog_arimax = AutoARIMA(season_length=7, prediction_intervals=ci)
+    model_names = _col_names(cv_models)
+    arima_col   = KNOWN_ALIASES["AutoARIMA"]
 
     # -----------------------------------------------------------------------
-    # CV-weighted ensemble
+    # CV-weighted ensemble (bare models — no conformal overhead during CV)
     # -----------------------------------------------------------------------
-    sf_uni = StatsForecast(models=univariate_models, freq="D", n_jobs=1)
-
     weights: dict[str, float] = {}
     errors:  dict[str, float] = {}
 
     if n >= MIN_ROWS_FOR_CV:
-        _p(f"Cross-validating {len(univariate_models)} models over {N_CV_WINDOWS} windows — this is the slowest step")
+        _p(f"Cross-validating {len(cv_models)} models ({N_CV_WINDOWS} windows)")
         try:
-            cv = sf_uni.cross_validation(
+            sf_cv = StatsForecast(models=cv_models, freq="D", n_jobs=1)
+            cv_df = sf_cv.cross_validation(
                 df=train[["unique_id", "ds", "y"]],
                 h=horizon_days,
                 n_windows=N_CV_WINDOWS,
                 step_size=horizon_days,
             )
-            actuals = cv["y"].values
-            for m in model_names_uni:
-                preds = cv[m].values
-                errors[m] = float(np.mean(np.abs(preds - actuals)))
+            actuals = cv_df["y"].values
+            for m in model_names:
+                errors[m] = float(np.mean(np.abs(cv_df[m].values - actuals)))
 
-            if build_x and exog_arimax is not None:
-                sf_exog_cv = StatsForecast(models=[exog_arimax], freq="D", n_jobs=1)
-                cv_exog = sf_exog_cv.cross_validation(
-                    df=train[["unique_id", "ds", "y"]],
-                    h=horizon_days,
-                    n_windows=N_CV_WINDOWS,
-                    step_size=horizon_days,
-                    X_df=x_train,
-                )
-                # Discover the real ARIMA alias from the CV output columns
-                exog_arima_col = [c for c in cv_exog.columns
-                                  if c not in ("unique_id", "ds", "y", "cutoff")][0]
-                errors[exog_arima_col] = float(
-                    np.mean(np.abs(cv_exog[exog_arima_col].values - cv_exog["y"].values))
-                )
-
-            _p("Cross-validation complete — computing ensemble weights")
-            # Inverse-error weighting (softmax-stable)
-            inv = {m: 1.0 / (e + 1e-6) for m, e in errors.items()}
+            _p("Cross-validation complete — computing weights")
+            inv   = {m: 1.0 / (e + 1e-6) for m, e in errors.items()}
             total = sum(inv.values())
             weights = {m: v / total for m, v in inv.items()}
 
-        except Exception:
-            # Fall back to equal weights if CV fails (e.g., too little data)
-            all_models = model_names_uni + ([arima_col] if build_x and exog_arimax else [])
-            weights = {m: 1.0 / len(all_models) for m in all_models}
-            errors  = {m: float("nan") for m in all_models}
+        except Exception as exc:
+            _p(f"CV failed ({exc}), using equal weights")
+            weights = {m: 1.0 / len(model_names) for m in model_names}
+            errors  = {m: float("nan") for m in model_names}
     else:
-        # Insufficient history for CV — equal weights
-        all_models = model_names_uni + ([arima_col] if build_x and exog_arimax else [])
-        weights = {m: 1.0 / len(all_models) for m in all_models}
-        errors  = {m: float("nan") for m in all_models}
+        weights = {m: 1.0 / len(model_names) for m in model_names}
+        errors  = {m: float("nan") for m in model_names}
 
     # -----------------------------------------------------------------------
-    # Fit on full training data and predict
+    # Final fit with conformal intervals
     # -----------------------------------------------------------------------
     _p("Fitting models on full training data")
-    sf_uni.fit(train[["unique_id", "ds", "y"]])
-    _p(f"Generating {horizon_days}-day forecast")
-    raw_uni = sf_uni.predict(h=horizon_days, level=[80])
+    sf_final = StatsForecast(models=final_models, freq="D", n_jobs=1)
+    sf_final.fit(train[["unique_id", "ds", "y"]])
 
-    # Build weighted forecast from univariate models
+    _p(f"Generating {horizon_days}-day forecast")
+    raw = sf_final.predict(h=horizon_days, level=[80])
+
     forecast = np.zeros(horizon_days)
     lo = np.zeros(horizon_days)
     hi = np.zeros(horizon_days)
 
-    for m in model_names_uni:
-        w = weights.get(m, 0.0)
-        forecast += w * raw_uni[m].values
-        lo_col = f"{m}-lo-80"
-        hi_col = f"{m}-hi-80"
-        if lo_col in raw_uni.columns:
-            lo += w * raw_uni[lo_col].values
-            hi += w * raw_uni[hi_col].values
+    for m in model_names:
+        w = weights.get(m, 1.0 / len(model_names))
+        forecast += w * raw[m].values
+        lo_col, hi_col = f"{m}-lo-80", f"{m}-hi-80"
+        if lo_col in raw.columns:
+            lo += w * raw[lo_col].values
+            hi += w * raw[hi_col].values
         else:
-            # Model doesn't return intervals — use point forecast ±20% as fallback
-            lo += w * (raw_uni[m].values * 0.80)
-            hi += w * (raw_uni[m].values * 1.20)
+            lo += w * raw[m].values * 0.80
+            hi += w * raw[m].values * 1.20
 
-    # Discover the real column alias for a standalone AutoARIMA model
-    arima_col = _get_model_col_names([AutoARIMA(season_length=7)])[0]
+    # -----------------------------------------------------------------------
+    # Exogenous AutoARIMA blend (only when orders/revenue/events provided)
+    # -----------------------------------------------------------------------
+    if build_x:
+        _p("Fitting exogenous ARIMAX model")
+        sf_x = StatsForecast(
+            models=[AutoARIMA(season_length=7, prediction_intervals=ci)],
+            freq="D", n_jobs=1,
+        )
+        sf_x.fit(train[["unique_id", "ds", "y"]], X_df=x_train)
+        raw_x = sf_x.predict(h=horizon_days, X_df=x_future, level=[80])
 
-    # Blend in exogenous AutoARIMA if active
-    if build_x and use_annual and exog_arimax:
-        sf_exog = StatsForecast(models=[exog_arimax], freq="D", n_jobs=1)
-        sf_exog.fit(train[["unique_id", "ds", "y"]], X_df=x_train)
-        raw_exog = sf_exog.predict(h=horizon_days, X_df=x_future, level=[80])
-        w_exog = weights.get(arima_col, 0.0)
-        forecast += w_exog * raw_exog[arima_col].values
-        lo += w_exog * raw_exog.get(f"{arima_col}-lo-80", raw_exog[arima_col]).values
-        hi += w_exog * raw_exog.get(f"{arima_col}-hi-80", raw_exog[arima_col]).values
+        # Give exog ARIMA 1/4 weight; redistribute the rest proportionally
+        exog_w = 0.25
+        scale  = 1.0 - exog_w
+        weights = {m: v * scale for m, v in weights.items()}
 
-    elif build_x and not use_annual:
-        # AutoARIMA is in univariate_models but was fit without X_df.
-        # Re-fit it with X_df and replace its contribution.
-        w_arima = weights.get(arima_col, 0.0)
-        if w_arima > 0:
-            sf_exog = StatsForecast(
-                models=[AutoARIMA(season_length=7, prediction_intervals=ci)],
-                freq="D", n_jobs=1,
-            )
-            sf_exog.fit(train[["unique_id", "ds", "y"]], X_df=x_train)
-            raw_exog = sf_exog.predict(h=horizon_days, X_df=x_future, level=[80])
+        forecast = scale * forecast + exog_w * raw_x[arima_col].values
+        lo_x = raw_x.get(f"{arima_col}-lo-80", raw_x[arima_col]).values
+        hi_x = raw_x.get(f"{arima_col}-hi-80", raw_x[arima_col]).values
+        lo = scale * lo + exog_w * lo_x
+        hi = scale * hi + exog_w * hi_x
+        weights[arima_col] = exog_w
+        errors[arima_col]  = float("nan")
 
-            # Subtract the univariate ARIMA contribution and add exog version
-            forecast -= w_arima * raw_uni[arima_col].values
-            lo       -= w_arima * raw_uni.get(f"{arima_col}-lo-80", raw_uni[arima_col]).values
-            hi       -= w_arima * raw_uni.get(f"{arima_col}-hi-80", raw_uni[arima_col]).values
-            forecast += w_arima * raw_exog[arima_col].values
-            lo       += w_arima * raw_exog.get(f"{arima_col}-lo-80", raw_exog[arima_col]).values
-            hi       += w_arima * raw_exog.get(f"{arima_col}-hi-80", raw_exog[arima_col]).values
-
-    _p("Assembling weighted ensemble forecast")
-    # Clamp to non-negative (count data)
+    _p("Assembling forecast")
     forecast = np.maximum(forecast, 0)
-    lo = np.maximum(lo, 0)
-    hi = np.maximum(hi, 0)
+    lo       = np.maximum(lo, 0)
+    hi       = np.maximum(hi, 0)
 
     return {
-        "dates": [d.strftime("%Y-%m-%d") for d in future_dates],
+        "dates":    [d.strftime("%Y-%m-%d") for d in future_dates],
         "forecast": forecast.round().astype(int).tolist(),
         "lower":    lo.round().astype(int).tolist(),
         "upper":    hi.round().astype(int).tolist(),
         "weights":  {m: round(v, 4) for m, v in weights.items()},
-        "errors":   {m: round(v, 2) if not math.isnan(v) else None for m, v in errors.items()},
-        "seasonality_mode": seasonality_mode,
-        "interval_type":    interval_type,
+        "errors":   {m: round(v, 2) if not math.isnan(v) else None
+                     for m, v in errors.items()},
+        "seasonality_mode":      seasonality_mode,
+        "interval_type":         "conformal",
         "has_annual_seasonality": use_annual,
-        "exogenous_used": build_x,
+        "exogenous_used":         build_x,
         "regressors": (
-            (["orders"] if has_orders else []) +
-            (["revenue"] if has_revenue else []) +
-            (["event_flags"] if has_events else [])
+            (["orders"]       if has_orders  else []) +
+            (["revenue"]      if has_revenue else []) +
+            (["event_flags"]  if has_events  else [])
         ),
     }
 
