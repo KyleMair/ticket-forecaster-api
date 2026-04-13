@@ -244,14 +244,27 @@ def run_model(
         exog_model_name = None  # AutoARIMA IS the exog model
 
     def _get_model_col_names(models):
-        """Fit on a tiny dummy series to discover the real statsforecast column aliases."""
+        """
+        Fit on a tiny dummy series to discover the real statsforecast column aliases.
+        We strip prediction_intervals off each model before the dummy fit — ConformalIntervals
+        requires hundreds of rows and would crash on the 30-row dummy series.
+        Column aliases are determined by model type, not by the intervals setting.
+        """
+        import copy
+        bare_models = []
+        for m in models:
+            m2 = copy.copy(m)
+            if hasattr(m2, "prediction_intervals"):
+                m2.prediction_intervals = None
+            bare_models.append(m2)
+
         rng = np.random.default_rng(42)
         dummy = pd.DataFrame({
             "unique_id": "x",
             "ds": pd.date_range("2020-01-01", periods=30, freq="D"),
             "y": rng.integers(50, 150, 30).astype(float),
         })
-        sf_tmp = StatsForecast(models=models, freq="D", n_jobs=1)
+        sf_tmp = StatsForecast(models=bare_models, freq="D", n_jobs=1)
         sf_tmp.fit(dummy)
         out = sf_tmp.predict(h=1)
         return [c for c in out.columns if c not in ("unique_id", "ds")]
