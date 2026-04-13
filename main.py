@@ -267,14 +267,15 @@ def run_model(
         cv_models    = [arima_bare, ces_bare,  theta_bare]
         final_models = [arima_ci,   ces_ci,    theta_ci]
 
-    model_names = _col_names(cv_models)
-    arima_col   = KNOWN_ALIASES["AutoARIMA"]
+    arima_col = KNOWN_ALIASES["AutoARIMA"]
 
     # -----------------------------------------------------------------------
     # CV-weighted ensemble (bare models — no conformal overhead during CV)
+    # Column names are read directly from the CV output, never assumed.
     # -----------------------------------------------------------------------
     weights: dict[str, float] = {}
     errors:  dict[str, float] = {}
+    model_names: list = []
 
     if n >= MIN_ROWS_FOR_CV:
         _p(f"Cross-validating {len(cv_models)} models ({N_CV_WINDOWS} windows)")
@@ -286,6 +287,8 @@ def run_model(
                 n_windows=N_CV_WINDOWS,
                 step_size=horizon_days,
             )
+            skip = {"unique_id", "ds", "y", "cutoff"}
+            model_names = [c for c in cv_df.columns if c not in skip]
             actuals = cv_df["y"].values
             for m in model_names:
                 errors[m] = float(np.mean(np.abs(cv_df[m].values - actuals)))
@@ -297,14 +300,18 @@ def run_model(
 
         except Exception as exc:
             _p(f"CV failed ({exc}), using equal weights")
+            model_names = _col_names(cv_models)
             weights = {m: 1.0 / len(model_names) for m in model_names}
             errors  = {m: float("nan") for m in model_names}
     else:
+        model_names = _col_names(cv_models)
         weights = {m: 1.0 / len(model_names) for m in model_names}
         errors  = {m: float("nan") for m in model_names}
 
     # -----------------------------------------------------------------------
     # Final fit with conformal intervals
+    # Read column names from actual predict output — paired by position with
+    # cv_models/final_models which are always in the same order.
     # -----------------------------------------------------------------------
     _p("Fitting models on full training data")
     sf_final = StatsForecast(models=final_models, freq="D", n_jobs=1)
@@ -313,20 +320,24 @@ def run_model(
     _p(f"Generating {horizon_days}-day forecast")
     raw = sf_final.predict(h=horizon_days, level=[80])
 
+    skip_pred = {"unique_id", "ds"}
+    raw_model_cols = [c for c in raw.columns
+                      if c not in skip_pred and not c.endswith(("-lo-80", "-hi-80"))]
+
     forecast = np.zeros(horizon_days)
     lo = np.zeros(horizon_days)
     hi = np.zeros(horizon_days)
 
-    for m in model_names:
-        w = weights.get(m, 1.0 / len(model_names))
-        forecast += w * raw[m].values
-        lo_col, hi_col = f"{m}-lo-80", f"{m}-hi-80"
+    for raw_col, cv_col in zip(raw_model_cols, model_names):
+        w = weights.get(cv_col, 1.0 / len(model_names))
+        forecast += w * raw[raw_col].values
+        lo_col, hi_col = f"{raw_col}-lo-80", f"{raw_col}-hi-80"
         if lo_col in raw.columns:
             lo += w * raw[lo_col].values
             hi += w * raw[hi_col].values
         else:
-            lo += w * raw[m].values * 0.80
-            hi += w * raw[m].values * 1.20
+            lo += w * raw[raw_col].values * 0.80
+            hi += w * raw[raw_col].values * 1.20
 
     # -----------------------------------------------------------------------
     # Exogenous AutoARIMA blend (only when orders/revenue/events provided)
