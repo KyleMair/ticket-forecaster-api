@@ -470,6 +470,66 @@ def health():
     return {"status": "ok", "service": "ticket-forecaster"}
 
 
+@app.post("/debug-csv")
+async def debug_csv(file: UploadFile = File(...)):
+    """
+    Debug endpoint — returns exactly what parse_csv sees from your file.
+    Hit this first when the forecast fails with a row-count error.
+    Returns: raw byte info, detected encoding/separator, column names, row count.
+    """
+    content = await file.read()
+    result = {}
+
+    # Raw byte inspection
+    result["file_size_bytes"] = len(content)
+    result["first_20_bytes_hex"] = content[:20].hex()
+    result["has_bom"] = content[:3] == b"\xef\xbb\xbf"
+
+    # Decode
+    text_sig  = content.decode("utf-8-sig", errors="replace")
+    text_raw  = content.decode("utf-8",     errors="replace")
+    result["first_line_raw"]     = text_raw.split("\n")[0]
+    result["first_line_bom_stripped"] = text_sig.split("\n")[0]
+
+    # Separator detection
+    first_line = text_sig.split("\n")[0]
+    sep = "\t" if "\t" in first_line else ","
+    result["detected_separator"] = "tab" if sep == "\t" else "comma"
+
+    # Parse
+    from io import StringIO
+    import pandas as pd
+    try:
+        df = pd.read_csv(StringIO(text_sig), sep=sep)
+        df.columns = [c.strip().lower() for c in df.columns]
+        result["parsed_columns"] = df.columns.tolist()
+        result["parsed_row_count"] = len(df)
+        result["first_3_rows"] = df.head(3).to_dict(orient="records")
+        result["null_counts"] = df.isnull().sum().to_dict()
+
+        # Simulate column mapping
+        date_candidates = ["date", "day", "ds"]
+        y_candidates = ["tickets", "y", "volume", "count", "ticket_count",
+                        "ticket_volume", "support_tickets", "num_tickets", "total_tickets"]
+        date_col = next((c for c in date_candidates if c in df.columns), None)
+        y_col    = next((c for c in y_candidates    if c in df.columns), None)
+        result["mapped_date_col"] = date_col
+        result["mapped_y_col"]    = y_col
+
+        if date_col and y_col:
+            df2 = df.rename(columns={date_col: "ds", y_col: "y"})
+            df2["ds"] = pd.to_datetime(df2["ds"], errors="coerce")
+            df2["y"]  = pd.to_numeric(df2["y"],   errors="coerce")
+            df2 = df2.dropna(subset=["ds", "y"])
+            result["rows_after_dropna"] = len(df2)
+        else:
+            result["rows_after_dropna"] = 0
+    except Exception as e:
+        result["parse_error"] = str(e)
+
+    return result
+
+
 @app.post("/forecast")
 async def forecast(
     file: UploadFile = File(...),
