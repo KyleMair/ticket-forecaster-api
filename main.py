@@ -707,17 +707,35 @@ async def forecast_stream(
 
     async def event_generator():
         loop = asyncio.get_event_loop()
+        TOTAL_TIMEOUT   = 600   # 10 min absolute ceiling
+        HEARTBEAT_EVERY = 15    # SSE comment every 15s keeps proxies/Render alive
+        start           = loop.time()
+        last_heartbeat  = start
+
         while True:
+            # Poll with a short timeout so we never block the event loop long
+            # enough to drop the connection or starve other coroutines.
             try:
                 kind, data = await loop.run_in_executor(
-                    None, lambda: msg_queue.get(timeout=120)
+                    None, lambda: msg_queue.get(timeout=0.5)
                 )
-            except Exception:
-                yield "data: ERROR:Request timed out\n\n"
+            except queue.Empty:
+                now = loop.time()
+                if now - start > TOTAL_TIMEOUT:
+                    yield "data: ERROR:Forecast timed out after 10 minutes\n\n"
+                    break
+                if now - last_heartbeat >= HEARTBEAT_EVERY:
+                    # SSE comment — invisible to JS but keeps the TCP connection open
+                    yield ": keep-alive\n\n"
+                    last_heartbeat = now
+                continue
+            except Exception as exc:
+                yield f"data: ERROR:{exc}\n\n"
                 break
 
             if kind == "progress":
                 yield f"data: {data}\n\n"
+                last_heartbeat = loop.time()
             elif kind == "result":
                 yield f"data: RESULT:{data}\n\n"
                 break
