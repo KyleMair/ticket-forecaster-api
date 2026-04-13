@@ -9,17 +9,19 @@ Upgraded model pipeline:
   - SQLite persistence for shareable forecast links
 """
 
+import asyncio
 import json
 import math
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from statsforecast import StatsForecast
@@ -127,6 +129,7 @@ def run_model(
     horizon_days: int,
     events: list[dict],
     has_regressors: bool,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
     Fit an ensemble of statistical models and return a forecast with
@@ -138,19 +141,25 @@ def run_model(
         horizon_days:    Number of days to forecast.
         events:          List of event dicts with start_date/end_date/window_days.
         has_regressors:  Whether orders/revenue columns are present.
+        progress:        Optional callback(message: str) called at key steps.
 
     Returns:
         dict with keys: dates, forecast, lower, upper, weights, errors,
                         seasonality_mode, interval_type
     """
+    def _p(msg: str):
+        if progress:
+            progress(msg)
     n = len(train)
     uid = train["unique_id"].iloc[0]
 
     # -----------------------------------------------------------------------
     # Decide seasonality mode
     # -----------------------------------------------------------------------
+    _p(f"Loaded {n} days of training data")
     use_annual = n >= MIN_ROWS_FOR_ANNUAL
     seasonality_mode = "weekly+annual (MSTL)" if use_annual else "weekly"
+    _p(f"Seasonality mode: {seasonality_mode}")
 
     # -----------------------------------------------------------------------
     # Build exogenous feature DataFrames
@@ -172,6 +181,8 @@ def run_model(
     # not AutoETS/AutoCES/AutoTheta). So if we have any exogenous data, we
     # build a unified X_df for AutoARIMA and run the others without it.
     build_x = has_events or (has_regressors and (has_orders or has_revenue))
+    if build_x:
+        _p("Building exogenous feature columns (orders, revenue, event flags)")
 
     if build_x:
         train_x = train[["unique_id", "ds"]].copy()
@@ -204,6 +215,7 @@ def run_model(
     # -----------------------------------------------------------------------
     # Conformal prediction intervals — guaranteed empirical coverage
     # -----------------------------------------------------------------------
+    _p("Configuring conformal prediction intervals")
     ci = ConformalIntervals(h=horizon_days, n_windows=N_CV_WINDOWS)
     interval_type = "conformal"
 
@@ -285,6 +297,7 @@ def run_model(
     errors:  dict[str, float] = {}
 
     if n >= MIN_ROWS_FOR_CV:
+        _p(f"Cross-validating {len(univariate_models)} models over {N_CV_WINDOWS} windows — this is the slowest step")
         try:
             cv = sf_uni.cross_validation(
                 df=train[["unique_id", "ds", "y"]],
@@ -313,6 +326,7 @@ def run_model(
                     np.mean(np.abs(cv_exog[exog_arima_col].values - cv_exog["y"].values))
                 )
 
+            _p("Cross-validation complete — computing ensemble weights")
             # Inverse-error weighting (softmax-stable)
             inv = {m: 1.0 / (e + 1e-6) for m, e in errors.items()}
             total = sum(inv.values())
@@ -332,7 +346,9 @@ def run_model(
     # -----------------------------------------------------------------------
     # Fit on full training data and predict
     # -----------------------------------------------------------------------
+    _p("Fitting models on full training data")
     sf_uni.fit(train[["unique_id", "ds", "y"]])
+    _p(f"Generating {horizon_days}-day forecast")
     raw_uni = sf_uni.predict(h=horizon_days, level=[80])
 
     # Build weighted forecast from univariate models
@@ -386,6 +402,7 @@ def run_model(
             lo       += w_arima * raw_exog.get(f"{arima_col}-lo-80", raw_exog[arima_col]).values
             hi       += w_arima * raw_exog.get(f"{arima_col}-hi-80", raw_exog[arima_col]).values
 
+    _p("Assembling weighted ensemble forecast")
     # Clamp to non-negative (count data)
     forecast = np.maximum(forecast, 0)
     lo = np.maximum(lo, 0)
@@ -622,6 +639,103 @@ async def forecast(
             "cv_errors":        result["errors"],
         },
     }
+
+
+@app.post("/forecast/stream")
+async def forecast_stream(
+    file: UploadFile = File(...),
+    params: str = Form(...),
+):
+    """
+    SSE streaming forecast endpoint.
+    Yields progress messages as `data: <message>\n\n` events, then a final
+    `data: RESULT:<json>\n\n` event containing the full forecast payload.
+    The frontend listens with EventSource (polyfilled via fetch+ReadableStream).
+    """
+    try:
+        req = json.loads(params)
+    except json.JSONDecodeError:
+        async def err():
+            yield "data: ERROR:params must be valid JSON\n\n"
+        return StreamingResponse(err(), media_type="text/event-stream")
+
+    horizon_days: int = int(req.get("horizon_days", 90))
+    events: list[dict] = req.get("events", [])
+    content = await file.read()
+
+    import queue, threading
+
+    msg_queue: queue.Queue = queue.Queue()
+
+    def progress(msg: str):
+        msg_queue.put(("progress", msg))
+
+    def worker():
+        try:
+            df = parse_csv(content)
+            has_regressors = "orders" in df.columns or "revenue" in df.columns
+            result = run_model(df, horizon_days, events, has_regressors, progress=progress)
+
+            forecast_rows = [
+                {"date": result["dates"][i], "forecast": result["forecast"][i],
+                 "lower": result["lower"][i], "upper": result["upper"][i]}
+                for i in range(horizon_days)
+            ]
+            payload = {
+                "forecast": forecast_rows,
+                "model_info": {
+                    "training_rows":    len(df),
+                    "training_from":    df["ds"].min().strftime("%Y-%m-%d"),
+                    "training_to":      df["ds"].max().strftime("%Y-%m-%d"),
+                    "regressors":       result["regressors"],
+                    "seasonality":      result["seasonality_mode"],
+                    "interval_type":    result["interval_type"],
+                    "has_annual":       result["has_annual_seasonality"],
+                    "exogenous_used":   result["exogenous_used"],
+                    "ensemble_weights": result["weights"],
+                    "cv_errors":        result["errors"],
+                },
+            }
+            msg_queue.put(("result", json.dumps(payload)))
+        except Exception as e:
+            msg_queue.put(("error", str(e)))
+        finally:
+            msg_queue.put(("done", None))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    async def event_generator():
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                kind, data = await loop.run_in_executor(
+                    None, lambda: msg_queue.get(timeout=120)
+                )
+            except Exception:
+                yield "data: ERROR:Request timed out\n\n"
+                break
+
+            if kind == "progress":
+                yield f"data: {data}\n\n"
+            elif kind == "result":
+                yield f"data: RESULT:{data}\n\n"
+                break
+            elif kind == "error":
+                yield f"data: ERROR:{data}\n\n"
+                break
+            elif kind == "done":
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @app.post("/forecast/save")
